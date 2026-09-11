@@ -1,6 +1,5 @@
 import os
 import requests
-import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, render_template_string
@@ -8,12 +7,16 @@ from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
 
 # ================================================
+# ⚙️ تنظیمات
+# ================================================
+MAX_PROXIES_PER_REQUEST = 20   # حداکثر پروکسی در هر درخواست
+MAX_TOTAL_TIME = 25            # حداکثر زمان کل تست (ثانیه)
+MAX_WORKERS = 10               # تعداد thread همزمان
+
+# ================================================
 # 🧪 تست یک پروکسی
 # ================================================
 def test_proxy(proxy_url, test_url="https://tapi.bale.ai", timeout=10):
-    """
-    تست پروکسی با اتصال به یه URL خاص
-    """
     result = {
         "proxy": proxy_url,
         "success": False,
@@ -24,11 +27,7 @@ def test_proxy(proxy_url, test_url="https://tapi.bale.ai", timeout=10):
     }
     
     try:
-        proxies = {
-            "http": proxy_url,
-            "https": proxy_url,
-        }
-        
+        proxies = {"http": proxy_url, "https": proxy_url}
         start_time = time.time()
         
         response = requests.get(
@@ -39,33 +38,34 @@ def test_proxy(proxy_url, test_url="https://tapi.bale.ai", timeout=10):
         )
         
         elapsed = time.time() - start_time
-        
         result["success"] = True
         result["status_code"] = response.status_code
         result["response_time"] = round(elapsed, 2)
         
-        # تست IP خارجی
+        # تست IP خارجی (با timeout کوتاه)
         try:
             ip_response = requests.get(
                 "https://api.ipify.org?format=json",
                 proxies=proxies,
-                timeout=10
+                timeout=5
             )
             if ip_response.status_code == 200:
                 result["ip_info"] = ip_response.json().get("ip")
         except:
             pass
         
-    except requests.exceptions.ProxyError as e:
-        result["error"] = f"Proxy Error: {str(e)[:100]}"
+    except requests.exceptions.ProxyError:
+        result["error"] = "Proxy Error"
     except requests.exceptions.ConnectTimeout:
-        result["error"] = "Connection Timeout"
+        result["error"] = "Connect Timeout"
     except requests.exceptions.ReadTimeout:
         result["error"] = "Read Timeout"
-    except requests.exceptions.SSLError as e:
-        result["error"] = f"SSL Error: {str(e)[:100]}"
+    except requests.exceptions.SSLError:
+        result["error"] = "SSL Error"
+    except requests.exceptions.ConnectionError:
+        result["error"] = "Connection Error"
     except Exception as e:
-        result["error"] = f"Error: {str(e)[:100]}"
+        result["error"] = f"Error: {str(e)[:50]}"
     
     return result
 
@@ -242,13 +242,24 @@ PAGE = """
             display: none;
         }
         .loading.active { display: block; }
-        .default-proxies {
+        .hint {
             font-size: 12px;
             color: #888;
             margin-top: 10px;
-            cursor: pointer;
-            text-decoration: underline;
         }
+        .hint code {
+            background: rgba(255,255,255,0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        .batch-info {
+            text-align: center;
+            color: #64b5f6;
+            font-size: 13px;
+            margin-top: 10px;
+            display: none;
+        }
+        .batch-info.active { display: block; }
     </style>
 </head>
 <body>
@@ -258,25 +269,34 @@ PAGE = """
 
         <div class="card">
             <label style="display:block;margin-bottom:10px;color:#aaa;">
-                لیست پروکسی‌ها (هر خط یکی):
+                لیست پروکسی‌ها (هر خط یکی - حداکثر 20 تا در هر بار):
             </label>
             <textarea id="proxyList" placeholder="socks5://93.118.127.222:1080&#10;socks5://185.142.156.229:2080">socks5://93.118.127.222:1080
 socks5://185.142.156.229:2080
 socks5://178.252.180.59:10909
 socks5://85.133.190.40:8097
-socks5://91.228.133.191:9999</textarea>
+socks5://91.228.133.191:9999
+socks5://109.230.83.178:5060
+socks5://94.182.199.250:8080
+socks5://81.90.144.170:9000
+socks5://213.207.198.254:8080
+socks5://5.202.52.103:6220</textarea>
 
             <div class="row">
                 <input type="text" id="testUrl" value="https://tapi.bale.ai" placeholder="URL تست">
                 <input type="text" id="timeout" value="10" placeholder="Timeout" style="max-width:100px;">
                 <button id="testBtn" onclick="testProxies()">🚀 شروع تست</button>
             </div>
-            <p class="default-proxies" onclick="loadDefaults()">بارگذاری پروکسی‌های پیش‌فرض</p>
+            <p class="hint">
+                ⚠️ حداکثر <code>20</code> پروکسی در هر بار. برای تست بیشتر، لیست را به دسته‌های 20 تایی تقسیم کنید.
+            </p>
         </div>
 
         <div class="loading" id="loading">
-            ⏳ در حال تست پروکسی‌ها... لطفاً صبر کنید
+            ⏳ در حال تست پروکسی‌ها... لطفاً صبر کنید (حداکثر 25 ثانیه)
         </div>
+
+        <div class="batch-info" id="batchInfo"></div>
 
         <div class="summary" id="summary" style="display:none;">
             <div class="stat green">
@@ -297,13 +317,7 @@ socks5://91.228.133.191:9999</textarea>
     </div>
 
     <script>
-        function loadDefaults() {
-            document.getElementById('proxyList').value = `socks5://93.118.127.222:1080
-socks5://185.142.156.229:2080
-socks5://178.252.180.59:10909
-socks5://85.133.190.40:8097
-socks5://91.228.133.191:9999`;
-        }
+        const MAX_PER_BATCH = 20;
 
         async function testProxies() {
             const proxyList = document.getElementById('proxyList').value
@@ -319,26 +333,58 @@ socks5://91.228.133.191:9999`;
             const testUrl = document.getElementById('testUrl').value;
             const timeout = parseInt(document.getElementById('timeout').value) || 10;
 
+            // اگه بیشتر از 20 تا بود، اول 20 تا رو تست کن
+            const batch = proxyList.slice(0, MAX_PER_BATCH);
+            const remaining = proxyList.length - batch.length;
+
             document.getElementById('testBtn').disabled = true;
             document.getElementById('loading').classList.add('active');
             document.getElementById('results').innerHTML = '';
             document.getElementById('summary').style.display = 'none';
+
+            const batchInfo = document.getElementById('batchInfo');
+            if (remaining > 0) {
+                batchInfo.textContent = `📦 تست دسته اول (${batch.length} از ${proxyList.length} پروکسی)`;
+                batchInfo.classList.add('active');
+            } else {
+                batchInfo.classList.remove('active');
+            }
 
             try {
                 const response = await fetch('/test', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        proxies: proxyList,
+                        proxies: batch,
                         test_url: testUrl,
                         timeout: timeout
                     })
                 });
 
+                // بررسی وضعیت پاسخ
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`HTTP ${response.status}: ${errorText.slice(0, 100)}`);
+                }
+
                 const data = await response.json();
+                
+                // بررسی وجود results
+                if (!data || !data.results) {
+                    throw new Error('پاسخ سرور ناقص است');
+                }
+
                 displayResults(data.results);
+                
+                if (remaining > 0) {
+                    batchInfo.textContent = `✅ دسته اول تست شد. ${remaining} پروکسی باقی‌مانده. لیست را به دسته بعدی تغییر دهید.`;
+                }
+                
             } catch (e) {
                 alert('خطا: ' + e.message);
+                console.error(e);
+                document.getElementById('results').innerHTML = 
+                    '<div style="color:#ff5252;text-align:center;padding:20px;">❌ خطا: ' + e.message + '</div>';
             } finally {
                 document.getElementById('testBtn').disabled = false;
                 document.getElementById('loading').classList.remove('active');
@@ -355,14 +401,14 @@ socks5://91.228.133.191:9999`;
 
                 let html = `
                     <div class="status">${r.success ? '✅' : '❌'}</div>
-                    <div class="proxy">${r.proxy}</div>
+                    <div class="proxy">${r.proxy || 'unknown'}</div>
                 `;
 
                 if (r.success) {
                     success++;
                     html += `
-                        <div class="time">${r.response_time}s</div>
-                        <div class="time">HTTP ${r.status_code}</div>
+                        <div class="time">${r.response_time || '?'}s</div>
+                        <div class="time">HTTP ${r.status_code || '?'}</div>
                     `;
                     if (r.ip_info) {
                         html += `<div class="ip-info">🌐 ${r.ip_info}</div>`;
@@ -381,12 +427,22 @@ socks5://91.228.133.191:9999`;
             document.getElementById('totalCount').textContent = results.length;
             document.getElementById('summary').style.display = 'flex';
         }
+
+        // Enter برای شروع تست
+        document.getElementById('proxyList').addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.key === 'Enter') {
+                testProxies();
+            }
+        });
     </script>
 </body>
 </html>
 """
 
 
+# ================================================
+# 🌐 روت‌ها
+# ================================================
 @app.route("/")
 def home():
     return render_template_string(PAGE)
@@ -394,46 +450,66 @@ def home():
 
 @app.route("/test", methods=["POST"])
 def test():
-    data = request.json
+    data = request.json or {}
     proxies = data.get("proxies", [])
     test_url = data.get("test_url", "https://tapi.bale.ai")
-    timeout = data.get("timeout", 10)
+    timeout = min(int(data.get("timeout", 10)), 15)  # حداکثر 15 ثانیه
     
     if not proxies:
-        return jsonify({"error": "پروکسی وارد نشده"}), 400
+        return jsonify({"error": "پروکسی وارد نشده", "results": []}), 400
+    
+    # محدود کردن تعداد
+    if len(proxies) > MAX_PROXIES_PER_REQUEST:
+        proxies = proxies[:MAX_PROXIES_PER_REQUEST]
     
     results = []
     
-    # تست همزمان با thread
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {
-            executor.submit(test_proxy, proxy, test_url, timeout): proxy
-            for proxy in proxies
-        }
-        
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                results.append({
-                    "proxy": futures[future],
-                    "success": False,
-                    "error": str(e)
-                })
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(test_proxy, proxy, test_url, timeout): proxy
+                for proxy in proxies
+            }
+            
+            for future in as_completed(futures, timeout=MAX_TOTAL_TIME):
+                try:
+                    result = future.result(timeout=2)
+                    results.append(result)
+                except Exception as e:
+                    results.append({
+                        "proxy": futures[future],
+                        "success": False,
+                        "error": "Timeout"
+                    })
+    except Exception as e:
+        print(f"❌ Test error: {e}")
     
     # مرتب‌سازی: موفق‌ها اول
-    results.sort(key=lambda x: (not x["success"], x.get("response_time", 999)))
+    results.sort(key=lambda x: (not x.get("success", False), x.get("response_time", 999)))
     
-    return jsonify({"results": results})
+    return jsonify({
+        "results": results,
+        "total_tested": len(results),
+        "requested": len(proxies)
+    })
 
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+# ================================================
+# 🚀 اجرا
+# ================================================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     
     print("=" * 55)
     print("🧪 پروکسی تستر - Railway")
     print(f"🌐 Listening on port {port}")
+    print(f"⚙️ Max proxies per request: {MAX_PROXIES_PER_REQUEST}")
+    print(f"⚙️ Max workers: {MAX_WORKERS}")
     print("=" * 55)
     
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
